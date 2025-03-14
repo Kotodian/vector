@@ -17,6 +17,9 @@ pub mod geoip;
 #[cfg(feature = "enrichment-tables-mmdb")]
 pub mod mmdb;
 
+#[cfg(feature = "enrichment-tables-redis")]
+pub mod redis;
+
 /// Configuration options for an [enrichment table](https://vector.dev/docs/reference/glossary/#enrichment-tables) to be used in a
 /// [`remap`](https://vector.dev/docs/reference/configuration/transforms/remap/) transform. Currently supported are:
 ///
@@ -62,6 +65,10 @@ pub enum EnrichmentTables {
     /// [maxmind]: https://www.maxmind.com/
     #[cfg(feature = "enrichment-tables-mmdb")]
     Mmdb(mmdb::MmdbConfig),
+
+    /// Exposes data from a Redis server as an enrichment table.
+    #[cfg(feature = "enrichment-tables-redis")]
+    Redis(redis::RedisConfig),
 }
 
 impl GenerateConfig for EnrichmentTables {
