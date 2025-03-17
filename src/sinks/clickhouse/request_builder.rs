@@ -33,7 +33,7 @@ impl RequestBuilder<(PartitionKey, Vec<Event>)> for ClickhouseRequestBuilder {
         let (key, mut events) = input;
 
         let finalizers = events.take_finalizers();
-        let builder = RequestMetadataBuilder::from_events(&events);
+        let builder: RequestMetadataBuilder = RequestMetadataBuilder::from_events(&events);
         ((key, finalizers), builder, events)
     }
 

@@ -752,6 +752,7 @@ sinks-logs = [
   "sinks-webhdfs",
   "sinks-websocket",
   "sinks-websocket-server",
+  "sinks-mongodb",
 ]
 sinks-metrics = [
   "sinks-appsignal",
@@ -824,7 +825,7 @@ sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
-
+sinks-mongodb = ["dep:mongodb"]
 # Identifies that the build is a nightly build
 nightly = []
 
