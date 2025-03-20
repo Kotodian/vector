@@ -1,12 +1,67 @@
 //! Handles enrichment tables for `type = redis`.
 
+use crate::config::{EnrichmentTableConfig, GenerateConfig};
 use futures::StreamExt;
-use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use vector_lib::configurable::configurable_component;
 use vector_lib::enrichment::{Case, Condition, IndexHandle, Table};
 use vrl::value::{ObjectMap, Value};
-use crate::config::{EnrichmentTableConfig, GenerateConfig};
+
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+async fn subscribe(
+    keys: Vec<String>,
+    db: u8,
+    cache: Arc<RwLock<HashMap<String, ObjectMap>>>,
+    client: redis::Client,
+) -> Result<(), backoff::Error<redis::RedisError>> {
+    let mut conn = client.get_async_connection().await.map_err(|e| backoff::Error::retry_after(e, RETRY_AFTER))?;
+    for key in &keys {
+        let datas: Option<HashMap<String, String>> =
+            redis::cmd("HGETALL").arg(key).query_async(&mut conn).await.map_err(|e| backoff::Error::retry_after(e, RETRY_AFTER))?;
+        if let Some(datas) = datas {
+            for (k, v) in datas {
+                let mut obj = ObjectMap::new();
+                obj.insert("key".into(), Value::from(key.to_string()));
+                obj.insert("value".into(), Value::from(v));
+                cache.write().unwrap().insert(k.clone(), obj);
+            }
+        }
+    }
+    let mut pubsub = client
+        .get_async_connection()
+        .await
+        .map_err(|e| backoff::Error::retry_after(e, RETRY_AFTER))?
+        .into_pubsub();
+    for key in &keys {
+        let _ = pubsub
+            .psubscribe(format!("__keyspace@{}__:{}", db, key))
+            .await
+            .map_err(|e| backoff::Error::retry_after(e, RETRY_AFTER))?;
+    }
+    let mut stream = pubsub.on_message();
+    while let Some(msg) = stream.next().await {
+        let channel: String = msg.get_channel_name().to_string();
+        if let Some(key) = channel.strip_prefix(&format!("__keyspace@{}__:", db)) {
+            let datas: Option<HashMap<String, String>> = redis::cmd("HGETALL")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| backoff::Error::retry_after(e, RETRY_AFTER))?;
+            if let Some(datas) = datas {
+                for (k, v) in datas {
+                    let mut obj = ObjectMap::new();
+                    obj.insert("key".into(), Value::from(key.to_string()));
+                    obj.insert("value".into(), Value::from(v));
+                    cache.write().unwrap().insert(k.clone(), obj);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Configuration for the `redis` enrichment table.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,80 +120,33 @@ impl Redis {
         }
 
         let url = if let Some(password) = &config.password {
-            format!("redis://:{}@{}:{}/{}", password,  config.host, config.port, config.db)
+            format!(
+                "redis://:{}@{}:{}/{}",
+                password, config.host, config.port, config.db
+            )
         } else {
             format!("redis://{}:{}/{}", config.host, config.port, config.db)
         };
         let client = redis::Client::open(url)?;
-        let pool = r2d2::Pool::builder().build(client)?;
-        // Test connection to validate host is reachable
-        let mut conn = pool.get()?;
         let cache = Arc::new(RwLock::new(HashMap::new()));
-        for key in &config.keys {
-            let datas: Option<HashMap<String, String>> = redis::cmd("HGETALL").arg(key).query(&mut conn).ok();
-            if let Some(datas) = datas {
-                for (k, v) in datas {
-                    let mut obj = ObjectMap::new();
-                    obj.insert("key".into(), Value::from(key.to_string()));
-                    obj.insert("value".into(), Value::from(v));
-                    cache.write().unwrap().insert(k.clone(), obj);
-                }
-            }
-        }
-
-        // start a new thread to listen these keys change
-        let pool = pool.clone();
-        let cache_c = cache.clone();
-        let keys = config.keys.clone();
-        let host = config.host.clone();
-        let port = config.port;
-        let password = config.password.clone();
-        let db = config.db;
+        let cache_clone = cache.clone();
+        let config_clone = config.clone();
 
         tokio::spawn(async move {
-            // Create a new connection for notifications
-            let url = if let Some(password) = password {
-                format!("redis://:{}@{}:{}/{}", password, host, port, db)
-            } else {
-                format!("redis://{}:{}/{}", host, port, db)
-            };
-
-            let client = match redis::Client::open(url) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-
-            let mut pubsub = match client.get_async_connection().await {
-                Ok(conn) => conn.into_pubsub(),
-                Err(_) => return,
-            };
-
-            // Subscribe to keyspace notifications for all configured keys
-            for key in keys {
-                let _ = pubsub.psubscribe(format!("__keyspace@{}__:{}", db, key)).await;
-            }
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = stream.next().await {
-                let channel: String = msg.get_channel_name().to_string();
-                if let Some(key) = channel.strip_prefix(&format!("__keyspace@{}__:", db)) {
-                    // Get a connection from pool
-                    if let Ok(mut conn) = pool.get() {
-                        // Fetch updated data
-                        if let Ok(datas) = redis::cmd("HGETALL").arg(key).query::<HashMap<String, String>>(&mut *conn) {
-                            let mut cache = cache_c.write().unwrap();
-                            for (k, v) in datas {
-                                let mut obj = ObjectMap::new();
-                                obj.insert("key".into(), Value::from(key.to_string()));
-                                obj.insert("value".into(), Value::from(v));
-                                cache.insert(k.clone(), obj);
-                            }
-                        }
-                    }
+            loop {
+                let res = subscribe(config_clone.keys.clone(), config_clone.db, cache_clone.clone(), client.clone()).await;
+                if let Err(e) = res {
+                    tokio::time::sleep(RETRY_AFTER).await;
+                    error!("Failed to subscribe to Redis: {}", e);
+                } else {
                 }
             }
         });
 
-        Ok(Self { config, cache: cache.clone() })
+        Ok(Self {
+            config: config,
+            cache: cache.clone(),
+        })
     }
 
     fn lookup(&self, field: &str) -> Option<ObjectMap> {
@@ -147,9 +155,15 @@ impl Redis {
 }
 
 impl Table for Redis {
-    fn find_table_row(&self, _: Case, condition: &[Condition], _select: Option<&[String]>, _index: Option<IndexHandle>) -> Result<ObjectMap, String> {
+    fn find_table_row(
+        &self,
+        _: Case,
+        condition: &[Condition],
+        _select: Option<&[String]>,
+        _index: Option<IndexHandle>,
+    ) -> Result<ObjectMap, String> {
         match condition.first() {
-            Some(Condition::Equals {field, value, .. }) => {
+            Some(Condition::Equals { field, value, .. }) => {
                 if *field == "field" {
                     let obj_map = self.lookup(&value.to_string_lossy());
                     if let Some(obj_map) = obj_map {
@@ -160,13 +174,19 @@ impl Table for Redis {
                 } else {
                     return Err("Only equality condition is allowed".to_string());
                 }
-                
             }
             _ => Err("Only equality condition is allowed".to_string()),
         }
     }
-    fn find_table_rows(&self, case: Case, condition: &[Condition], select: Option<&[String]>, index: Option<IndexHandle>) -> Result<Vec<ObjectMap>, String> {
-        self.find_table_row(case, condition, select, index).map(|row| vec![row])
+    fn find_table_rows(
+        &self,
+        case: Case,
+        condition: &[Condition],
+        select: Option<&[String]>,
+        index: Option<IndexHandle>,
+    ) -> Result<Vec<ObjectMap>, String> {
+        self.find_table_row(case, condition, select, index)
+            .map(|row| vec![row])
     }
 
     fn add_index(&mut self, _: Case, _: &[&str]) -> Result<IndexHandle, String> {
@@ -184,14 +204,22 @@ impl Table for Redis {
 
 impl std::fmt::Debug for Redis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Redis {{ host: {}, port: {}, password: {:?}, db: {}, keys: {:?} }}", self.config.host, self.config.port, self.config.password, self.config.db, self.config.keys)
+        write!(
+            f,
+            "Redis {{ host: {}, port: {}, password: {:?}, db: {}, keys: {:?} }}",
+            self.config.host,
+            self.config.port,
+            self.config.password,
+            self.config.db,
+            self.config.keys
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_lookup() {
         let config = RedisConfig {
