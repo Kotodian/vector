@@ -1,11 +1,14 @@
-name: Cross - Release Binaries
+name: Cross
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., v1.0.0)"
+        required: true
 
 permissions:
-  contents: write
+  contents: write  # 允许创建和上传 release
 
 jobs:
   cross-linux:
@@ -19,8 +22,8 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-musleabihf
           - arm-unknown-linux-gnueabi
@@ -45,19 +48,64 @@ jobs:
       - run: |
           rustup target add ${{ matrix.target }}
           cargo install cross --version 0.2.4 --force --locked
-      - run: make cross-build-${{ matrix.target }}-release  # Build Release
+
+      - name: Build with cross
+        run: make cross-build-${{ matrix.target }}
+
       - uses: actions/upload-artifact@v4
         with:
-          name: "vector-release-${{ matrix.target }}"
-          path: "./target/${{ matrix.target }}/release/vector"
-      - name: Rename binary and upload for release
-        run: |
-          mkdir -p release-binaries
-          mv "./target/${{ matrix.target }}/release/vector" "release-binaries/vector-${{ matrix.target }}"
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+          name: "vector-${{ matrix.target }}"
+          path: "./target/${{ matrix.target }}/debug/vector"
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-24.04
+    needs: cross-linux
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./release-binaries/vector-${{ matrix.target }}
-          asset_name: vector-${{ matrix.target }}
-          asset_content_type: application/octet-stream
+          tag_name: ${{ github.event.inputs.version }}
+          release_name: Release ${{ github.event.inputs.version }}
+          draft: false
+          prerelease: false
+
+  upload-release-assets:
+    name: Upload Release Assets
+    runs-on: ubuntu-24.04
+    needs: [cross-linux, create-release]
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-gnueabi
+          - arm-unknown-linux-musleabi
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: "vector-${{ matrix.target }}"
+          path: "./artifacts"
+
+      - name: Compress binary
+        run: |
+          tar -czvf "vector-${{ matrix.target }}.tar.gz" -C "./artifacts" .
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: "vector-${{ matrix.target }}.tar.gz"
+          tag_name: ${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
