@@ -1,10 +1,11 @@
-name: Cross
+name: Cross - Release Binaries
 
 on:
-  workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
-  statuses: write
+  contents: write
 
 jobs:
   cross-linux:
@@ -18,30 +19,13 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+          -l
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-musleabihf
           - arm-unknown-linux-gnueabi
           - arm-unknown-linux-musleabi
     steps:
-      - name: (PR review) Set latest commit status as pending
-        if: ${{ github.event_name == 'pull_request_review' }}
-        uses: myrotvorets/set-commit-status-action@v2.0.1
-        with:
-          sha: ${{ github.event.review.commit_id }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Cross
-          status: pending
-
-      - name: (PR review) Checkout PR branch
-        if: ${{ github.event_name == 'pull_request_review' }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.review.commit_id }}
-
       - name: Checkout branch
-        if: ${{ github.event_name != 'pull_request_review' }}
         uses: actions/checkout@v4
 
       - uses: actions/cache@v4
@@ -58,37 +42,21 @@ jobs:
 
       - run: echo "::add-matcher::.github/matchers/rust.json"
       - run: |
-          rustup target add x86_64-unknown-linux-gnu
+          rustup target add ${{ matrix.target }}
           cargo install cross --version 0.2.4 --force --locked
-      # Why is this build, not check? Because we need to make sure the linking phase works.
-      # aarch64 and musl in particular are notoriously hard to link.
-      # While it may be tempting to slot a `check` in here for quickness, please don't.
-      - run: make cross-build-${{ matrix.target }}
+      - run: make cross-build-${{ matrix.target }}-release  # Build Release
       - uses: actions/upload-artifact@v4
         with:
-          name: "vector-debug-${{ matrix.target }}"
-          path: "./target/${{ matrix.target }}/debug/vector"
-
-      - name: (PR review) Set latest commit status as failed
-        uses: myrotvorets/set-commit-status-action@v2.0.1
-        if: failure() && github.event_name == 'pull_request_review'
+          name: "vector-release-${{ matrix.target }}"
+          path: "./target/${{ matrix.target }}/release/vector"
+      - name: Rename binary and upload for release
+        run: |
+          mkdir -p release-binaries
+          mv "./target/${{ matrix.target }}/release/vector" "release-binaries/vector-${{ matrix.target }}"
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
         with:
-          sha: ${{ steps.comment-branch.outputs.head_sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Cross
-          status: 'failure'
-
-  update-pr-status:
-    name: (PR review) Signal result to PR
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    needs: cross-linux
-    if: needs.cross-linux.result == 'success' && github.event_name == 'pull_request_review'
-    steps:
-      - name: (PR review) Submit PR result as success
-        uses: myrotvorets/set-commit-status-action@v2.0.1
-        with:
-          sha: ${{ github.event.review.commit_id }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          context: Cross
-          status: 'success'
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./release-binaries/vector-${{ matrix.target }}
+          asset_name: vector-${{ matrix.target }}
+          asset_content_type: application/octet-stream
