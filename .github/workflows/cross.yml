@@ -1,7 +1,7 @@
 name: Cross
 
 on:
-  workflow_call:
+  workflow_dispatch:
 
 permissions:
   statuses: write
